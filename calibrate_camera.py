@@ -1,9 +1,10 @@
 import cv2
 import numpy as np
 import yaml
-import tkinter as tk
+import os
+import time
 
-class ChessboardCalibrator:
+class AutoChessboardCalibrator:
     def __init__(self):
         # ----------------------------------------------------
         # Chessboard settings for A4 board:
@@ -25,32 +26,13 @@ class ChessboardCalibrator:
         self.capture_count = 0
         self.min_captures = 5  # Minimum images required for calibration
 
-        # These will be updated each frame:
-        self.current_frame = None
-        self.current_gray = None
-        self.current_found = False
-        self.current_corners = None
+        # To avoid duplicate captures, add a delay (in seconds)
+        self.last_capture_time = 0
+        self.capture_delay = 1.0  # seconds
 
-        # Flag to signal finishing capture
-        self.finished = False
-
-    def on_capture(self):
-        """Callback for the 'Capture' button."""
-        if self.current_found:
-            self.objpoints.append(self.objp)
-            self.imgpoints.append(self.current_corners)
-            self.capture_count += 1
-            print(f"Captured frame #{self.capture_count}")
-        else:
-            print("Chessboard pattern not detected; cannot capture.")
-
-    def on_finish(self):
-        """Callback for the 'Finish' button."""
-        if self.capture_count < self.min_captures:
-            print(f"Need at least {self.min_captures} captures for calibration. "
-                  f"Only {self.capture_count} captured.")
-        else:
-            self.finished = True
+        # Calibration results (to be set after calibration)
+        self.camera_matrix = None
+        self.dist_coeffs = None
 
     def run(self):
         cap = cv2.VideoCapture(0)
@@ -58,70 +40,59 @@ class ChessboardCalibrator:
             print("Error: Cannot open video capture")
             return
 
-        window_name = "Chessboard Calibration"
+        window_name = "Auto Chessboard Calibration"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-        # Create a separate Tkinter window for the buttons
-        root = tk.Tk()
-        root.title("Calibration Controls")
-        capture_button = tk.Button(root, text="Capture", command=self.on_capture)
-        capture_button.pack(side="left", padx=10, pady=10)
-        finish_button = tk.Button(root, text="Finish", command=self.on_finish)
-        finish_button.pack(side="left", padx=10, pady=10)
-
-        print("Focus the OpenCV video window and the Tkinter control window.")
-        print("Press the buttons to capture images or finish.")
-        print("You can also press ESC in the video window to exit.")
-
+        print("Starting automatic calibration. Show the chessboard to the camera.")
         while True:
             ret, frame = cap.read()
             if not ret:
                 print("Error: Cannot read frame")
                 break
 
-            self.current_frame = frame.copy()
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            self.current_gray = gray
 
             # Try to find the chessboard corners in the current frame
             found, corners = cv2.findChessboardCorners(gray, self.chessboard_size, None)
-            self.current_found = found
             if found:
-                # Refine corner positions for better accuracy
+                # Refine the corner locations for higher accuracy
                 criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
                 corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-                self.current_corners = corners
                 cv2.drawChessboardCorners(frame, self.chessboard_size, corners, found)
-            else:
-                self.current_corners = None
 
-            # Display instructions and capture status on the frame
-            status_text = f"Captured: {self.capture_count} / {self.min_captures} images"
+                current_time = time.time()
+                # Only capture if enough time has passed since the last capture
+                if current_time - self.last_capture_time > self.capture_delay:
+                    self.objpoints.append(self.objp)
+                    self.imgpoints.append(corners)
+                    self.capture_count += 1
+                    self.last_capture_time = current_time
+                    print(f"Auto-captured frame #{self.capture_count}")
+
+            # Display capture status on the video feed
+            status_text = f"Captured: {self.capture_count}/{self.min_captures}"
             cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                         0.8, (0, 255, 0), 2)
-            cv2.putText(frame, "Use the Tkinter window to capture/finish", (10, 60),
+            cv2.putText(frame, "Press ESC to quit manually", (10, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             cv2.imshow(window_name, frame)
 
-            # Process Tkinter events
-            root.update_idletasks()
-            root.update()
-
-            # Check for ESC key to exit
             key = cv2.waitKey(30) & 0xFF
-            if key == 27:  # ESC key
-                self.finished = True
+            if key == 27:  # ESC key to exit manually
+                print("Manual exit triggered")
+                break
 
-            if self.finished:
+            # If we have enough captures, break the loop and calibrate
+            if self.capture_count >= self.min_captures:
+                print("Required captures obtained. Calibrating...")
                 break
 
         cap.release()
         cv2.destroyAllWindows()
-        root.destroy()
 
         if self.capture_count < self.min_captures:
-            print("Not enough valid captures for calibration.")
+            print("Not enough valid captures for calibration. Exiting.")
             return
 
         # ----------------------------------------------------
@@ -130,10 +101,12 @@ class ChessboardCalibrator:
         ret_calib, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
             self.objpoints, self.imgpoints, gray.shape[::-1], None, None
         )
-
         if not ret_calib:
             print("Calibration failed.")
             return
+
+        self.camera_matrix = camera_matrix
+        self.dist_coeffs = dist_coeffs
 
         print("Calibration succeeded.")
         print("Camera Matrix:")
@@ -141,32 +114,44 @@ class ChessboardCalibrator:
         print("Distortion Coefficients:")
         print(dist_coeffs)
 
-        # ----------------------------------------------------
-        # Write calibration data to a YAML file (OpenCV style)
-        # ----------------------------------------------------
-        calib_data = {
-            "width": frame.shape[1],
-            "height": frame.shape[0],
-            "calibration": {
-                "rows": 3,
-                "cols": 3,
-                "dt": "d",
-                "data": camera_matrix.flatten().tolist()
-            },
-            "distortion": {
-                "rows": 1,
-                "cols": int(dist_coeffs.size),
-                "dt": "d",
-                "data": dist_coeffs.flatten().tolist()
-            }
-        }
+        # Save calibration data in the requested YAML format
+        self.save_calibration(frame)
+        print("Calibration process completed.")
 
-        output_filename = "./calibration.yaml"
+    def save_calibration(self, frame):
+        # Convert intrinsic parameters to native Python types
+        fx = float(self.camera_matrix[0, 0])
+        fy = float(self.camera_matrix[1, 1])
+        cx = float(self.camera_matrix[0, 2])
+        cy = float(self.camera_matrix[1, 2])
+        # Flatten the distortion coefficients to native floats.
+        dist_list = [float(x) for x in self.dist_coeffs.flatten().tolist()]
+        # Combine into one list.
+        calibration_list = [fx, fy, cx, cy] + dist_list
+
+        # Get image dimensions
+        height, width = frame.shape[:2]
+
+        # Prepare the output string manually to match the desired format.
+        # Note: This will output the list inline exactly as you specified.
+        output = (
+            f"width: {width}\n"
+            f"height: {height}\n"
+            "# With distortion (fx, fy, cx, cy, k1, k2, p1, p2)\n"
+            f"calibration:  {calibration_list}\n"
+        )
+
+        # Save to "config/intrinsics.yaml" in the script directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        output_dir = os.path.join(script_dir, "config")
+        os.makedirs(output_dir, exist_ok=True)
+        output_filename = os.path.join(output_dir, "intrinsics.yaml")
+
         with open(output_filename, "w") as f:
-            yaml.dump(calib_data, f)
+            f.write(output)
 
         print(f"Calibration data saved to {output_filename}")
 
 if __name__ == '__main__':
-    calibrator = ChessboardCalibrator()
+    calibrator = AutoChessboardCalibrator()
     calibrator.run()
